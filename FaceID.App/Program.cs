@@ -1,422 +1,326 @@
-using System.Diagnostics;
+// Program.cs
+//
+// Commands:
+//   scan      walk a folder, find faces, save gallery.json
+//   search    probe one image against the saved gallery (file-level or person-level)
+//   enroll    NEW  name + images/folders -> add named identity samples to the gallery
+//   cluster   NEW  group all gallery entries into likely identities (union-find)
+//   export    NEW  dump the gallery as CSV
+//
+// Options:
+//   --threshold F   detection confidence cutoff        default 0.60
+//   --match F       cosine similarity match cutoff     default 0.363
+//   --gallery PATH  where to read/write the gallery    default gallery.json
+//   --min-face N    NEW  smallest usable face, px      default 48
+//   --gpu           NEW  run on CUDA instead of CPU
+//
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using Emgu.CV.CvEnum;
+using Emgu.CV.Dnn;
+using FaceTool;
 
-namespace FaceID.App;
+namespace FaceTool;
 
-public static class Program
+internal static class Program
 {
-    private const string DefaultGallery = "gallery.json";
-
-    public static int Main(string[] args)
+    private sealed class Options
     {
-        var options = new Options();
-        List<string> positional;
+        public float Threshold = 0.60f;
+        public float Match = 0.363f;
+        public string GalleryPath = "gallery.json";
+        public float MinFace = 48f;
+        public bool Gpu = false;
+    }
 
+    private static readonly string[] ImageExtensions =
+        [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"];
+
+    private static int Main(string[] args)
+    {
         try
         {
-            positional = options.Parse(args);
-        }
-        catch (ArgumentException ex)
-        {
-            Console.Error.WriteLine($"faceid: {ex.Message}");
-            Console.Error.WriteLine("try 'faceid --help'");
-            return 2;
-        }
+            if (args.Length == 0) return Usage(null);
 
-        if (options.Help || positional.Count == 0)
-        {
-            PrintUsage();
-            return positional.Count == 0 && !options.Help ? 2 : 0;
-        }
+            string cmd = args[0].ToLowerInvariant();
+            if (cmd is "-h" or "--help") return Usage(null);
 
-        string command = positional[0].ToLowerInvariant();
-        List<string> rest = positional.Skip(1).ToList();
-
-        try
-        {
-            return command switch
+            var options = new Options();
+            var rest = new List<string>();
+            for (int i = 1; i < args.Length; i++)
             {
-                "recognize" => Recognize(rest, options),
-                "compare"   => Compare(rest, options),
-                "search"    => Search(rest, options),
-                _ => Usage($"unknown command '{command}'"),
+                string arg = args[i];
+                switch (arg)
+                {
+                    case "--threshold": options.Threshold = Next(args, ref i, arg); break;
+                    case "--match": options.Match = Next(args, ref i, arg); break;
+                    case "--gallery": options.GalleryPath = NextString(args, ref i, arg); break;
+                    case "--min-face": options.MinFace = Next(args, ref i, arg); break;
+                    case "--gpu": options.Gpu = true; break;
+                    case "--": break; // everything after -- is positional
+                    default:
+                        if (arg.StartsWith("--")) throw new ArgumentException($"unknown option '{arg}'");
+                        rest.Add(arg);
+                        break;
+                }
+            }
+
+            return cmd switch
+            {
+                "scan" => Scan(rest, options),
+                "search" => Search(rest, options),
+                "enroll" => Enroll(rest, options),
+                "cluster" => Cluster(rest, options),
+                "export" => Export(rest, options),
+                _ => Usage($"unknown command '{cmd}'"),
             };
         }
-        catch (Exception ex) when (ex is IOException or InvalidDataException or InvalidOperationException)
+        catch (Exception ex)
         {
-            Console.Error.WriteLine($"faceid: {ex.Message}");
-            return 1;
+            Console.Error.WriteLine($"error: {ex.Message}");
+            return 2;
         }
     }
 
-    // ---------------------------------------------------------------- recognize
+    // ------------------------------------------------------------------ scan
 
-    private static int Recognize(List<string> args, Options options)
+    private static int Scan(List<string> args, Options options)
     {
-        if (args.Count != 1) return Usage("recognize takes exactly one folder");
+        if (args.Count == 0) return Usage("scan takes one or more files/folders");
 
-        string folder = args[0];
-        if (!Directory.Exists(folder))
-            return Fail($"no such folder: {folder}");
+        var paths = args.SelectMany(a => Directory.Exists(a)
+            ? ImageFilesIn(a)
+            : File.Exists(a) ? [a]
+            : []).Distinct().ToList();
 
-        string[] images = ImageFilesIn(folder);
-        if (images.Length == 0) return Fail($"no images in {folder}");
+        if (paths.Count == 0) return Fail("no readable images given");
+        Console.WriteLine($"{paths.Count} image(s) to process\n");
 
-        Console.WriteLine($"Scanning {images.Length} images in {Path.GetFullPath(folder)}");
-        Console.WriteLine($"Detection threshold {options.DetectThreshold:F2}");
-        Console.WriteLine();
+        using var engine = MakeEngine(options);
+        var gallery = new Gallery();
 
-        using var engine = new FaceEngine(options.DetectorModel, options.RecognizerModel, options.DetectThreshold);
-        var stopwatch = Stopwatch.StartNew();
-
-        var gallery = new Gallery
+        foreach (string p in paths)
         {
-            SourceFolder = Path.GetFullPath(folder),
-            DetectThreshold = options.DetectThreshold,
-        };
-
-        int skipped = 0, crowded = 0, faces = 0;
-        TextWriter? log = options.Quiet ? null : Console.Out;
-
-        foreach (string path in images)
-        {
-            if (!options.Quiet) Console.WriteLine($"    {Path.GetFileName(path)}");
-
-            FaceRecord? record = engine.Analyze(path, log);
-            if (record is null)
-            {
-                if (options.Quiet) Console.WriteLine($"    {Path.GetFileName(path)}  - no face");
-                skipped++;
-                continue;
-            }
-
-            faces += record.FaceCount;
-            if (record.FaceCount > 1) crowded++;
-
-            gallery.Entries.Add(new GalleryEntry
-            {
-                File = record.File,
-                Path = record.Path,
-                Score = record.Subject.Score,
-                FaceCount = record.FaceCount,
-                Embedding = record.Embedding,
-            });
+            Console.WriteLine($"    {Path.GetFileName(p)}");
+            FaceRecord? r = engine.Analyze(p, Console.Out);
+            if (r is not null)
+                gallery.Entries.Add(new GalleryEntry
+                {
+                    File = r.File,
+                    Path = r.Path,
+                    Score = r.Subject.Score,
+                    FaceCount = r.Boxes.Count,
+                    Embedding = r.Embedding,
+                    Sharpness = r.Sharpness,   // NEW
+                });
         }
 
-        stopwatch.Stop();
-
-        Console.WriteLine();
-        Console.WriteLine(new string('-', 60));
-        Console.WriteLine($"{images.Length} images scanned in {stopwatch.Elapsed.TotalSeconds:F1}s");
-        Console.WriteLine($"{faces} faces detected");
-        Console.WriteLine($"{gallery.Entries.Count} identities enrolled");
-        Console.WriteLine($"{skipped} images with no usable face");
-        Console.WriteLine($"{crowded} images with more than one face");
-
-        if (gallery.Entries.Count > 0)
-        {
-            GalleryEntry weakest = gallery.Entries.MinBy(e => e.Score)!;
-            GalleryEntry strongest = gallery.Entries.MaxBy(e => e.Score)!;
-            Console.WriteLine($"weakest subject  {weakest.File} at {weakest.Score:F3}");
-            Console.WriteLine($"strongest subject {strongest.File} at {strongest.Score:F3}");
-        }
-
-        if (!options.NoSave)
-        {
-            gallery.Save(options.GalleryPath);
-            Console.WriteLine($"gallery written to {Path.GetFullPath(options.GalleryPath)}");
-        }
-
+        gallery.Save(options.GalleryPath);
+        Console.WriteLine($"\n{gallery.Entries.Count}/{paths.Count} enrolled -> {options.GalleryPath}");
         return 0;
     }
 
-    // ------------------------------------------------------------------ compare
-
-    private static int Compare(List<string> args, Options options)
-    {
-        if (args.Count != 2) return Usage("compare takes exactly two images or identities");
-
-        Gallery? gallery = TryLoadGallery(options.GalleryPath);
-
-        // The models are only loaded if an argument turns out to be a file on
-        // disk. Comparing two already-enrolled identities never touches them.
-        FaceEngine? engine = null;
-        try
-        {
-            float[]? a = Resolve(args[0], gallery, options, ref engine, out string labelA);
-            if (a is null) return Fail($"no face for {args[0]}");
-            float[]? b = Resolve(args[1], gallery, options, ref engine, out string labelB);
-            if (b is null) return Fail($"no face for {args[1]}");
-
-            double score = Similarity.Cosine(a, b);
-            bool same = score >= options.MatchThreshold;
-
-            Console.WriteLine();
-            Console.WriteLine($"{labelA}");
-            Console.WriteLine($"{labelB}");
-            Console.WriteLine($"    cosine {score:F3} {(same ? ">=" : " <")} {options.MatchThreshold:F3}");
-            Console.WriteLine($"    ->  {(same ? "SAME PERSON" : "NOT THE SAME PERSON")}");
-            return 0;
-        }
-        finally { engine?.Dispose(); }
-    }
-
-    // ------------------------------------------------------------------- search
+    // ----------------------------------------------------------------- search
 
     private static int Search(List<string> args, Options options)
     {
-        if (args.Count is < 1 or > 2)
-            return Usage("search takes a probe image and optionally a folder");
+        if (args.Count != 1) return Usage("search takes exactly one probe image");
+        string probePath = args[0];
+        if (!File.Exists(probePath)) return Fail($"no such file: {probePath}");
 
-        Gallery gallery;
-        if (args.Count == 2)
+        Gallery gallery = TryLoadGallery(options.GalleryPath);
+        if (gallery.Entries.Count == 0) return Fail("gallery is empty - run 'scan' first");
+
+        using var engine = MakeEngine(options);
+        FaceRecord? probe = engine.Analyze(probePath, Console.Out);
+        if (probe is null) return Fail("no usable face in probe image");
+
+        // NEW: person-level matching when identities exist (max-pooled over samples).
+        if (gallery.HasNamedPersons())
         {
-            string folder = args[1];
-            if (!Directory.Exists(folder)) return Fail($"no such folder: {folder}");
-            Console.WriteLine($"Scanning {folder} (no gallery given)");
-            gallery = ScanQuietly(folder, options);
-        }
-        else
-        {
-            gallery = TryLoadGallery(options.GalleryPath)
-                ?? throw new FileNotFoundException(
-                    $"no gallery at {options.GalleryPath}. Run 'faceid recognize <folder>' first, "
-                    + "or pass a folder as the second argument.");
+            Console.WriteLine("\nbest matches (per person):");
+            foreach ((string person, double score) in gallery.Persons
+                         .Select(p => (Person: p, gallery.BestMatch(probe.Embedding, p)))
+                         .OrderByDescending(r => r.Item2).Take(5))
+            {
+                string mark = score >= options.Match ? "<-- MATCH" : "";
+                Console.WriteLine($"    {score,7:F4}  {person,-24} {mark}");
+            }
+            return 0;
         }
 
-        if (gallery.Entries.Count == 0) return Fail("the gallery is empty");
-
-        FaceEngine? engine = null;
-        float[]? probe;
-        string label;
-        try
-        {
-            probe = Resolve(args[0], gallery, options, ref engine, out label);
-        }
-        finally { engine?.Dispose(); }
-
-        if (probe is null) return Fail($"no face for {args[0]}");
-
-        string probeName = Path.GetFileName(args[0]);
+        // Fall back to per-file ranking (original behavior).
         var ranked = gallery.Entries
-            .Where(e => !string.Equals(e.File, probeName, StringComparison.OrdinalIgnoreCase))
-            .Select(e => (e.File, Score: Similarity.Cosine(probe, e.Embedding)))
+            .Select(e => (Entry: e, Score: Similarity.Cosine(probe.Embedding, e.Embedding)))
             .OrderByDescending(r => r.Score)
-            .ToList();
+            .Take(5);
 
-        var matched  = ranked.Where(r => r.Score >= options.MatchThreshold).ToList();
-        var rejected = ranked.Where(r => r.Score <  options.MatchThreshold).ToList();
-
-        Console.WriteLine();
-        Console.WriteLine($"Looking for {label}");
-        Console.WriteLine($"among {ranked.Count} enrolled identities");
-        Console.WriteLine();
-
-        if (matched.Count == 0)
-            Console.WriteLine("    no match anywhere");
-        foreach (var m in matched)
-            Console.WriteLine($"    MATCH      {m.File,-34} {m.Score:F3}");
-
-        Console.WriteLine($"    - - - - -  threshold {options.MatchThreshold:F3}  - - - - -");
-        foreach (var r in rejected.Take(options.Top))
-            Console.WriteLine($"    rejected   {r.File,-34} {r.Score:F3}");
-
-        Console.WriteLine();
-        Console.Write($"{matched.Count} match(es)");
-        if (matched.Count > 0 && rejected.Count > 0)
-            Console.Write($", clear of the closest rejection by {matched[^1].Score - rejected[0].Score:F3}");
-        Console.WriteLine();
+        Console.WriteLine("\nbest matches:");
+        foreach (var (entry, score) in ranked)
+        {
+            string mark = score >= options.Match ? "<-- MATCH" : "";
+            Console.WriteLine($"    {score,7:F4}  {entry.File,-34} {mark}");
+        }
         return 0;
     }
 
-    // ------------------------------------------------------------------ helpers
+    // ----------------------------------------------------------------- enroll
 
-    /// <summary>
-    /// An argument may be a path to an image on disk or the name of an already
-    /// enrolled identity. A real file wins, so a fresh photo is always re-read.
-    /// </summary>
-    private static float[]? Resolve(
-        string arg, Gallery? gallery, Options options, ref FaceEngine? engine, out string label)
+    private static int Enroll(List<string> args, Options options)
     {
-        if (File.Exists(arg))
-        {
-            label = $"{Path.GetFileName(arg)}  (read from disk)";
-            engine ??= new FaceEngine(options.DetectorModel, options.RecognizerModel, options.DetectThreshold);
-            FaceRecord? record = engine.Analyze(arg);
-            return record?.Embedding;
-        }
+        if (args.Count < 2) return Usage("enroll takes a name then one or more images/folders");
+        string person = args[0];
 
-        GalleryEntry? entry = gallery?.Find(arg);
-        if (entry is not null)
-        {
-            label = $"{entry.File}  (from gallery)";
-            return entry.Embedding;
-        }
+        var paths = args.Skip(1).SelectMany(a => Directory.Exists(a)
+            ? ImageFilesIn(a)
+            : File.Exists(a) ? [a]
+            : []).Distinct().ToList();
+        if (paths.Count == 0) return Fail("no readable images given");
 
-        label = arg;
-        return null;
-    }
+        Gallery gallery = TryLoadGallery(options.GalleryPath) ?? new Gallery();
+        using var engine = MakeEngine(options);
 
-    private static Gallery ScanQuietly(string folder, Options options)
-    {
-        using var engine = new FaceEngine(options.DetectorModel, options.RecognizerModel, options.DetectThreshold);
-        var gallery = new Gallery
+        int added = 0;
+        foreach (string p in paths)
         {
-            SourceFolder = Path.GetFullPath(folder),
-            DetectThreshold = options.DetectThreshold,
-        };
+            Console.WriteLine($"    {Path.GetFileName(p)}");
+            FaceRecord? r = engine.Analyze(p, Console.Out);
+            if (r is null) continue;
 
-        foreach (string path in ImageFilesIn(folder))
-        {
-            FaceRecord? record = engine.Analyze(path);
-            if (record is null) continue;
+            // Duplicate guard: skip near-identical embeddings already stored.
+            if (gallery.Entries.Any(e => Similarity.Cosine(e.Embedding, r.Embedding) > 0.99))
+            {
+                Console.WriteLine("        duplicate of existing entry, skipped");
+                continue;
+            }
+
             gallery.Entries.Add(new GalleryEntry
             {
-                File = record.File,
-                Path = record.Path,
-                Score = record.Subject.Score,
-                FaceCount = record.FaceCount,
-                Embedding = record.Embedding,
+                File = r.File,
+                Path = r.Path,
+                Score = r.Subject.Score,
+                FaceCount = r.Boxes.Count,
+                Embedding = r.Embedding,
+                Person = person,        // NEW
+                Sharpness = r.Sharpness,   // NEW
             });
+            added++;
         }
-        return gallery;
+
+        gallery.Save(options.GalleryPath);
+        Console.WriteLine($"\n'{person}': {added} new sample(s), "
+                        + $"{gallery.For(person).Count()} total -> {options.GalleryPath}");
+        return 0;
     }
 
-    private static Gallery? TryLoadGallery(string path) =>
-        File.Exists(path) ? Gallery.Load(path) : null;
+    // ---------------------------------------------------------------- cluster
 
-    private static string[] ImageFilesIn(string folder) =>
-        Directory.EnumerateFiles(folder)
-                 .Where(p => Path.GetExtension(p).ToLowerInvariant()
-                     is ".jpg" or ".jpeg" or ".png" or ".bmp")
-                 .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
-                 .ToArray();
-
-    private static int Usage(string message)
+    private static int Cluster(List<string> _, Options options)
     {
-        Console.Error.WriteLine($"faceid: {message}");
-        Console.Error.WriteLine("try 'faceid --help'");
-        return 2;
-    }
+        Gallery g = TryLoadGallery(options.GalleryPath);
+        if (g.Entries.Count == 0) return Fail("gallery is empty");
 
-    private static int Fail(string message)
-    {
-        Console.Error.WriteLine($"faceid: {message}");
-        return 1;
-    }
+        int n = g.Entries.Count;
+        var parent = Enumerable.Range(0, n).ToArray();
+        int Find(int i) { while (parent[i] != i) i = parent[i] = parent[parent[i]]; return i; }
 
-    private static void PrintUsage()
-    {
-        Console.WriteLine("""
-            faceid - detect, compare and search faces
+        // Union-find: link any pair above the match threshold.
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++)
+                if (Similarity.Cosine(g.Entries[i].Embedding, g.Entries[j].Embedding)
+                    >= options.Match)
+                    parent[Find(i)] = Find(j);
 
-            USAGE
-              faceid recognize <folder>              scan a folder and enrol one identity per image
-              faceid compare   <a> <b>               compare two images, or two enrolled identities
-              faceid search    <probe> [folder]      find a probe face among the enrolled ones
-
-            An identity is the 128 numbers SFace produces for a face. 'recognize' writes
-            them to a gallery file so later commands do not have to scan again. Arguments
-            to 'compare' and 'search' may be image paths or names already in the gallery.
-
-            OPTIONS
-              --gallery <path>      gallery file to read or write (default: gallery.json)
-              --no-save             recognize: report results without writing the gallery
-              --detect <float>      detection confidence floor, 0 to 1 (default: 0.60)
-              --match <float>       same-person cosine cutoff (default: 0.371)
-              --top <n>             search: how many near misses to list (default: 3)
-              -q, --quiet           less per-image detail
-              --detector <path>     override the YuNet model file
-              --recognizer <path>   override the SFace model file
-              -h, --help            this text
-
-            EXAMPLES
-              faceid recognize imgs
-              faceid compare imgs/Abdullah_Gul_0003.jpg imgs/Abdullah_Gul_0004.jpg
-              faceid compare Abdullah_Gul_0003.jpg Adam_Sandler_0003.jpg
-              faceid search grafik.png imgs
-              faceid search Adrien_Brody_0006.jpg --match 0.42
-
-            EXIT CODES
-              0 success    1 runtime error    2 bad usage
-            """);
-    }
-}
-
-/// <summary>Hand-rolled option parsing, so the tool carries no extra dependency.</summary>
-internal sealed class Options
-{
-    public string GalleryPath { get; private set; } = "gallery.json";
-    public float DetectThreshold { get; private set; } = 0.60f;
-    public double MatchThreshold { get; private set; } = 0.371;
-    public int Top { get; private set; } = 3;
-    public bool Quiet { get; private set; }
-    public bool NoSave { get; private set; }
-    public bool Help { get; private set; }
-
-    public string DetectorModel { get; private set; } =
-        Path.Combine(AppContext.BaseDirectory, "models", "face_detection_yunet_2026may.onnx");
-    public string RecognizerModel { get; private set; } =
-        Path.Combine(AppContext.BaseDirectory, "models", "face_recognition_sface_2021dec.onnx");
-
-    /// <summary>Consumes the options and returns whatever positional arguments remain.</summary>
-    public List<string> Parse(string[] args)
-    {
-        var positional = new List<string>();
-
-        for (int i = 0; i < args.Length; i++)
+        Console.WriteLine($"{n} entries grouped by cosine >= {options.Match:F3}\n");
+        foreach (var group in Enumerable.Range(0, n).GroupBy(Find)
+                                        .OrderByDescending(gr => gr.Count()))
         {
-            string arg = args[i];
-            switch (arg)
+            Console.WriteLine($"cluster of {group.Count()}:");
+            foreach (int i in group)
             {
-                case "-h" or "--help":    Help = true; break;
-                case "-q" or "--quiet":   Quiet = true; break;
-                case "--no-save":         NoSave = true; break;
-                case "--gallery":         GalleryPath = Next(args, ref i, arg); break;
-                case "--detector":        DetectorModel = Next(args, ref i, arg); break;
-                case "--recognizer":      RecognizerModel = Next(args, ref i, arg); break;
-                case "--detect":          DetectThreshold = ParseUnit(Next(args, ref i, arg), arg); break;
-                case "--match":           MatchThreshold = ParseCosine(Next(args, ref i, arg), arg); break;
-                case "--top":             Top = ParseCount(Next(args, ref i, arg), arg); break;
-                default:
-                    if (arg.StartsWith('-') && arg.Length > 1)
-                        throw new ArgumentException($"unknown option '{arg}'");
-                    positional.Add(arg);
-                    break;
+                var e = g.Entries[i];
+                string person = e.Person ?? "-";
+                Console.WriteLine($"    {e.File,-34} {person,-20} score {e.Score:F3}");
             }
+            Console.WriteLine();
         }
-        return positional;
+        return 0;
     }
 
-    private static string Next(string[] args, ref int i, string option)
+    // ----------------------------------------------------------------- export
+
+    private static int Export(List<string> args, Options options)
     {
-        if (i + 1 >= args.Length) throw new ArgumentException($"{option} needs a value");
-        return args[++i];
+        string outPath = args.Count == 1 ? args[0] : "gallery.csv";
+        Gallery g = TryLoadGallery(options.GalleryPath);
+        if (g.Entries.Count == 0) return Fail("gallery is empty");
+
+        using var w = new StreamWriter(outPath);
+        w.WriteLine("file,person,score,faces,sharpness,enrolled");
+        foreach (var e in g.Entries)
+            // Invariant throughout: a decimal comma would split one value across
+            // two CSV columns on locales like de-DE.
+            w.WriteLine($"\"{e.File}\",\"{e.Person ?? ""}\","
+                      + $"{e.Score.ToString("F3", CultureInfo.InvariantCulture)},{e.FaceCount},"
+                      + $"{e.Sharpness?.ToString("F0", CultureInfo.InvariantCulture) ?? ""},{e.Enrolled:O}");
+        Console.WriteLine($"{g.Entries.Count} rows -> {outPath}");
+        return 0;
     }
 
-    private static float ParseUnit(string text, string option)
+    // ------------------------------------------------------------------ misc
+
+    private static FaceEngine MakeEngine(Options o) =>
+        new(FaceEngine.DefaultDetectorModel, FaceEngine.DefaultRecognizerModel,
+            o.Threshold, o.MinFace,
+            o.Gpu ? Target.Cuda : Target.Cpu);
+
+    private static Gallery TryLoadGallery(string path) =>
+        File.Exists(path)
+            ? Gallery.Load(path)
+            : throw new FileNotFoundException($"no gallery at {path}", path);
+
+    private static IEnumerable<string> ImageFilesIn(string dir) =>
+        Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories)
+                 .Where(f => ImageExtensions.Contains(Path.GetExtension(f).ToLowerInvariant()));
+
+    private static float Next(IReadOnlyList<string> a, ref int i, string opt)
     {
-        if (!float.TryParse(text, System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out float value))
-            throw new ArgumentException($"{option} expects a number, got '{text}'");
-        if (value is < 0 or > 1)
-            throw new ArgumentException($"{option} must be between 0 and 1, got {text}");
-        return value;
+        if (!float.TryParse(NextString(a, ref i, opt),
+                            NumberStyles.Float, CultureInfo.InvariantCulture, out float v))
+            throw new ArgumentException($"{opt} needs a number");
+        return v;
     }
 
-    private static double ParseCosine(string text, string option)
+    private static string NextString(IReadOnlyList<string> a, ref int i, string opt)
     {
-        if (!double.TryParse(text, System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out double value))
-            throw new ArgumentException($"{option} expects a number, got '{text}'");
-        if (value is < -1 or > 1)
-            throw new ArgumentException($"{option} must be between -1 and 1, got {text}");
-        return value;
+        if (++i >= a.Count) throw new ArgumentException($"{opt} needs a value");
+        return a[i];
     }
 
-    private static int ParseCount(string text, string option)
+    private static int Usage(string? error)
     {
-        if (!int.TryParse(text, out int value) || value < 0)
-            throw new ArgumentException($"{option} expects a non-negative whole number, got '{text}'");
-        return value;
+        if (error is not null) Console.Error.WriteLine($"error: {error}\n");
+        Console.WriteLine("""
+            usage:
+              FaceTool scan    <files-or-folders...> [--gallery P] [--threshold F] [--min-face N] [--gpu]
+              FaceTool search  <probe-image>        [--gallery P] [--match F]
+              FaceTool enroll  <name> <images...>   [--gallery P]
+              FaceTool cluster                      [--gallery P] [--match F]
+              FaceTool export  [out.csv]            [--gallery P]
+
+            examples:
+              FaceTool scan ./photos --gallery db.json
+              FaceTool enroll alice ./alice-pics
+              FaceTool enroll bob   bob1.jpg bob2.jpg
+              FaceTool search probe.jpg --gallery db.json
+              FaceTool cluster --gallery db.json
+            """);
+        return error is null ? 0 : 1;
     }
+
+    private static int Fail(string message) { Console.Error.WriteLine($"error: {message}"); return 2; }
 }
