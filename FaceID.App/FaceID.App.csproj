@@ -19,4 +19,9 @@
     <Content Include="models\*.onnx" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Options is internal; the test project needs to reach it. -->
+    <InternalsVisibleTo Include="FaceID.Tests" />
+  </ItemGroup>
+
 </Project>
