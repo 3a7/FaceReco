@@ -56,8 +56,8 @@ public sealed class FaceEngine : IDisposable
     {
         // STAGE 1 - capture. ColorBgr because both models were trained on
         // OpenCV's native blue-green-red order; ColorRgb silently lowers scores.
-        using Mat? image = TryRead(imagePath);
-        if (image is null)
+        using Mat image = CvInvoke.Imread(imagePath, ImreadModes.ColorBgr);
+        if (image.IsEmpty)
         {
             log?.WriteLine("        could not read this file");
             return null;
@@ -128,28 +128,6 @@ public sealed class FaceEngine : IDisposable
 
         return new FaceRecord(
             System.IO.Path.GetFileName(imagePath), imagePath, boxes[subject], boxes.Length, embedding);
-    }
-
-    /// <summary>
-    /// Emgu throws ArgumentException for a file that is missing or cannot be
-    /// decoded rather than handing back an empty Mat, so a single unreadable
-    /// file would otherwise abort a whole folder scan.
-    /// </summary>
-    private static Mat? TryRead(string imagePath)
-    {
-        Mat? image = null;
-        try
-        {
-            image = CvInvoke.Imread(imagePath, ImreadModes.ColorBgr);
-            if (!image.IsEmpty) return image;
-        }
-        catch (ArgumentException)
-        {
-            // falls through to the cleanup below
-        }
-
-        image?.Dispose();
-        return null;
     }
 
     private static FaceBox ReadRow(Mat detections, int index)
